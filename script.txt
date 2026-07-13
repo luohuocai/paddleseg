@@ -1,0 +1,21 @@
+CUDA_VISIBLE_DEVICES=0 python tools/train.py \
+  --config /home/vina01/PaddleSeg-release-2.10/datasets/srs/srs+_1280x640_30k_boost.yml \
+  --device gpu \
+  --do_eval \
+  --use_vdl \
+  --num_workers 4 \
+  --save_interval 1000 \
+  --save_dir output/segformer_b0_srs+_1280x640_30k_boost
+
+
+CUDA_VISIBLE_DEVICES=0 python tools/predict.py \
+  --config /home/vina01/PaddleSeg-release-2.10/datasets/srs/srs+_1280x640_30k_boost.yml \
+  --model_path /home/vina01/PaddleSeg-release-2.10/output/b1_big_area/best_model/model.pdparams \
+  --image_path /home/vina01/PaddleSeg-release-2.10/datasets/test_srs \
+  --save_dir /home/vina01/PaddleSeg-release-2.10/output/b1_big_area/best_model_res\
+  --device gpu
+
+
+python tools/export.py --config /home/vina01/PaddleSeg-release-2.10/datasets/srs/srs+_1280x640_30k_boost.yml --model_path /home/vina01/PaddleSeg-release-2.10/output/big_area/iter_47000/model.pdparams --save_dir /home/vina01/PaddleSeg-release-2.10/output/big_area/iter_47000 --input_shape 1 3 640 1280 --output_op none
+
+paddle2onnx --model_dir /home/vina01/PaddleSeg-release-2.10/output/big_area/iter_47000 --model_filename model.json --params_filename model.pdiparams --save_file /home/vina01/PaddleSeg-release-2.10/output/big_area/iter_47000/model.onnx --opset_version 17 --enable_onnx_checker True
