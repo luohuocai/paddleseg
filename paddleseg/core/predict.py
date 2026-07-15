@@ -45,6 +45,11 @@ def preprocess(im_path, transforms):
     return data
 
 
+def normalized_path(path):
+    """Return the normalized absolute path used by prediction label maps."""
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
 def predict(model,
             model_path,
             transforms,
@@ -59,7 +64,13 @@ def predict(model,
             stride=None,
             crop_size=None,
             custom_color=None,
-            use_multilabel=False):
+            use_multilabel=False,
+            label_map=None,
+            class_names=None,
+            annotate_classes=False,
+            annotation_min_area=20,
+            background_id=0,
+            ignore_index=255):
     """
     predict and visualize the image_list.
 
@@ -81,6 +92,16 @@ def predict(model,
             It should be provided when `is_slide` is True.
         custom_color (list, optional): Save images with a custom color map. Default: None, use paddleseg's default color map.
         use_multilabel (bool, optional): Whether to enable multilabel mode. Default: False.
+        label_map (dict, optional): Mapping from normalized image paths to
+            ground-truth mask or LabelMe JSON paths. Default: None.
+        class_names (list, optional): Class names indexed by class id.
+            Default: None.
+        annotate_classes (bool, optional): Whether to annotate GT and predicted
+            types on added_prediction images. Default: False.
+        annotation_min_area (int, optional): Minimum component area to annotate.
+            Default: 20.
+        background_id (int, optional): Background class id. Default: 0.
+        ignore_index (int, optional): Ignored ground-truth class id. Default: 255.
 
     """
     utils.utils.load_entire_model(model, model_path)
@@ -98,6 +119,7 @@ def predict(model,
     logger.info("Start to predict...")
     progbar_pred = progbar.Progbar(target=len(img_lists[0]), verbose=1)
     color_map = visualize.get_color_map_list(256, custom_color=custom_color)
+    label_map = label_map or {}
     with paddle.no_grad():
         for i, im_path in enumerate(img_lists[local_rank]):
             data = preprocess(im_path, transforms)
@@ -137,6 +159,22 @@ def predict(model,
             # save added image
             added_image = utils.visualize.visualize(
                 im_path, pred, color_map, weight=0.6, use_multilabel=use_multilabel)
+            if annotate_classes:
+                label_path = label_map.get(normalized_path(im_path))
+                try:
+                    added_image = utils.visualize.annotate_segmentation_classes(
+                        added_image,
+                        pred,
+                        label_path=label_path,
+                        class_names=class_names,
+                        background_id=background_id,
+                        ignore_index=ignore_index,
+                        min_area=annotation_min_area,
+                        use_multilabel=use_multilabel)
+                except Exception as error:
+                    logger.warning(
+                        'Failed to annotate classes for {}: {}'.format(
+                            im_path, error))
             added_image_path = os.path.join(added_saved_dir, im_file)
             mkdir(added_image_path)
             cv2.imwrite(added_image_path, added_image)

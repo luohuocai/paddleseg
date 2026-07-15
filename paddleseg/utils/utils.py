@@ -227,9 +227,11 @@ def get_image_list(image_path):
             image_list.append(image_path)
         else:
             image_dir = os.path.dirname(image_path)
-            with open(image_path, 'r') as f:
+            with open(image_path, 'r', encoding='utf-8-sig') as f:
                 for line in f:
                     line = line.strip()
+                    if not line:
+                        continue
                     if len(line.split()) > 1:
                         line = line.split()[0]
                     image_list.append(os.path.join(image_dir, line))
@@ -253,6 +255,51 @@ def get_image_list(image_path):
             'There are not image file in `--image_path`={}'.format(image_path))
 
     return image_list, image_dir
+
+
+def get_image_list_with_labels(image_path):
+    """Get images and the optional labels from a PaddleSeg file list.
+
+    PaddleSeg file lists use ``image_path label_path`` on each line.  The
+    existing :func:`get_image_list` intentionally discards the second column;
+    this helper preserves it for prediction visualizations that need to show
+    ground-truth information.  Single-image and directory inputs remain
+    supported and simply return an empty label map.
+
+    Args:
+        image_path (str): An image, an image directory, or a PaddleSeg file
+            list.
+
+    Returns:
+        tuple: ``(image_list, image_dir, label_map)``.  ``label_map`` is keyed
+        by normalized absolute image path.
+    """
+    image_list, image_dir = get_image_list(image_path)
+    label_map = {}
+    valid_suffix = {
+        '.JPEG', '.jpeg', '.JPG', '.jpg', '.BMP', '.bmp', '.PNG', '.png'
+    }
+
+    if not os.path.isfile(image_path) or os.path.splitext(
+            image_path)[-1] in valid_suffix:
+        return image_list, image_dir, label_map
+
+    list_dir = os.path.dirname(os.path.abspath(image_path))
+    with open(image_path, 'r', encoding='utf-8-sig') as file_list:
+        for line in file_list:
+            columns = line.strip().split()
+            if len(columns) < 2:
+                continue
+            image_file, label_file = columns[:2]
+            if not os.path.isabs(image_file):
+                image_file = os.path.join(list_dir, image_file)
+            if not os.path.isabs(label_file):
+                label_file = os.path.join(list_dir, label_file)
+            image_key = os.path.normcase(
+                os.path.abspath(os.path.normpath(image_file)))
+            label_map[image_key] = os.path.normpath(label_file)
+
+    return image_list, image_dir, label_map
 
 
 class NoAliasDumper(yaml.SafeDumper):
