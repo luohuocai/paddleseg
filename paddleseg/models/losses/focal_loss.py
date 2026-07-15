@@ -130,3 +130,84 @@ class MultiClassFocalLoss(nn.Layer):
         focal_loss *= mask
         avg_loss = paddle.mean(focal_loss) / (paddle.mean(mask) + self.EPS)
         return avg_loss
+
+
+@manager.LOSSES.add_component
+class FocalTverskyLoss(nn.Layer):
+    """
+    Multi-class focal Tversky loss for imbalanced segmentation.
+
+    Args:
+        alpha (float, optional): False positive weight. Default: 0.3.
+        beta (float, optional): False negative weight. Default: 0.7.
+        gamma (float, optional): Focal exponent. Default: 1.33.
+        include_background (bool, optional): Whether class 0 is included.
+            Default: True.
+        present_classes_only (bool, optional): Average only classes present in
+            labels. Default: False.
+        ignore_index (int64, optional): Label value to ignore. Default: 255.
+        smooth (float, optional): Smoothing value. Default: 1.0.
+    """
+
+    def __init__(self,
+                 alpha=0.3,
+                 beta=0.7,
+                 gamma=1.33,
+                 include_background=True,
+                 present_classes_only=False,
+                 ignore_index=255,
+                 smooth=1.0):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.include_background = include_background
+        self.present_classes_only = present_classes_only
+        self.ignore_index = ignore_index
+        self.smooth = smooth
+        self.eps = 1e-8
+
+    def forward(self, logit, label):
+        assert logit.ndim == 4, "The ndim of logit should be 4."
+        assert label.ndim in [3, 4], "The ndim of label should be 3 or 4."
+
+        if label.ndim == 4:
+            label = paddle.squeeze(label, axis=1)
+
+        num_classes = logit.shape[1]
+        valid_mask = label != self.ignore_index
+        safe_label = paddle.where(valid_mask, label, paddle.zeros_like(label))
+        safe_label = safe_label.astype('int64')
+        label_one_hot = F.one_hot(safe_label, num_classes)
+        label_one_hot = paddle.transpose(label_one_hot, [0, 3, 1, 2])
+        label_one_hot = paddle.cast(label_one_hot, logit.dtype)
+
+        valid_mask = paddle.unsqueeze(valid_mask, axis=1)
+        valid_mask = paddle.cast(valid_mask, logit.dtype)
+        valid_mask.stop_gradient = True
+        label_one_hot = label_one_hot * valid_mask
+        label_one_hot.stop_gradient = True
+
+        prob = F.softmax(logit, axis=1) * valid_mask
+        reduce_axes = [0, 2, 3]
+        true_pos = paddle.sum(prob * label_one_hot, axis=reduce_axes)
+        false_pos = paddle.sum(prob * (1 - label_one_hot), axis=reduce_axes)
+        false_neg = paddle.sum((1 - prob) * label_one_hot, axis=reduce_axes)
+
+        tversky = (true_pos + self.smooth) / (
+            true_pos + self.alpha * false_pos + self.beta * false_neg +
+            self.smooth + self.eps)
+        loss = paddle.pow(1 - tversky, self.gamma)
+
+        class_mask = paddle.ones([num_classes], dtype=logit.dtype)
+        if not self.include_background and num_classes > 1:
+            class_mask = paddle.concat(
+                [paddle.zeros([1], dtype=logit.dtype), class_mask[1:]])
+
+        if self.present_classes_only:
+            present_mask = paddle.sum(label_one_hot, axis=reduce_axes) > 0
+            present_mask = paddle.cast(present_mask, logit.dtype)
+            class_mask = class_mask * present_mask
+
+        class_mask.stop_gradient = True
+        return paddle.sum(loss * class_mask) / (paddle.sum(class_mask) + self.eps)
