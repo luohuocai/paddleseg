@@ -402,10 +402,10 @@ def annotate_defect_evaluation(image,
     """Render the hit/miss/over visualization used by defect evaluation.
 
     Ground-truth components hit by any prediction are green, missed ground
-    truths are red, and matched predictions are cyan.  Matching intentionally
-    ignores class names and uses contour IoU with bounding-box fallback.  A
-    missing label is treated as an OK image, matching the standalone batch
-    evaluator.
+    truths are red, matched predictions are cyan, and unmatched (over-detected)
+    predictions are purple.  Matching intentionally ignores class names and
+    uses contour IoU with bounding-box fallback.  A missing label is treated as
+    an OK image, matching the standalone batch evaluator.
 
     Returns:
         tuple: The rendered BGR image and its object/sample statistics.
@@ -462,9 +462,15 @@ def annotate_defect_evaluation(image,
 
     for index, pred_object in enumerate(pred_objects):
         if pred_hit[index]:
-            _draw_evaluation_object(rendered, pred_object, (255, 255, 0),
-                                    'P:' + pred_object['class_name'], 2,
-                                    component_font_scale)
+            color = (255, 255, 0)
+            text = 'P:' + pred_object['class_name']
+            thickness = 2
+        else:
+            color = (255, 0, 255)
+            text = 'OVER:' + pred_object['class_name']
+            thickness = 4
+        _draw_evaluation_object(rendered, pred_object, color, text, thickness,
+                                component_font_scale)
 
     header = (
         'GT={gt_object_count} Pred={pred_object_count} '

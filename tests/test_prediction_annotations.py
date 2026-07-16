@@ -159,6 +159,7 @@ class PredictionAnnotationsTest(unittest.TestCase):
             self.assertIn('GT:BL', texts)
             self.assertIn('MISS GT:BL', texts)
             self.assertIn('P:GS', texts)
+            self.assertIn('OVER:GS', texts)
             self.assertIn(
                 'GT=2 Pred=2 miss_sample=0 over_sample=0 miss_obj=1 over_obj=1',
                 texts)
