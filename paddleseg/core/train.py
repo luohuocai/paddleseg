@@ -29,6 +29,8 @@ from paddleseg.utils import (TimeAverager, calculate_eta, resume,
                              init_ema_params, update_ema_model, logger)
 from paddleseg.core.val import evaluate
 from paddleseg.core.export import export, save_model_info, update_train_results
+from paddleseg.utils.eval_history import (prepare_eval_history,
+                                          update_eval_history)
 from paddleseg.utils.logger import setup_logger
 
 
@@ -107,7 +109,8 @@ def train(model,
         losses (dict, optional): A dict including 'types' and 'coef'. The length of coef should equal to 1 or len(losses['types']).
             The 'types' item is a list of object of paddleseg.models.losses while the 'coef' item is a list of the relevant coefficient.
         keep_checkpoint_max (int, optional): Maximum number of checkpoints to save. Default: 5.
-        test_config(dict, optional): Evaluation config.
+        test_config(dict, optional): Evaluation config. Sample-level defect
+            metrics are enabled by default for validation during training.
         precision (str, optional): Use AMP if precision='fp16'. If precision='fp32', the training is normal.
         amp_level (str, optional): Auto mixed precision level. Accepted values are “O1” and “O2”: O1 represent mixed precision,
             the input data type of each operator will be casted by white_list and black_list; O2 represent Pure fp16, all operators
@@ -140,6 +143,15 @@ def train(model,
         if os.path.exists(save_dir):
             os.remove(save_dir)
         os.makedirs(save_dir, exist_ok=True)
+
+    if val_dataset is not None and local_rank == 0:
+        resume_iteration = start_iter if resume_model is not None else None
+        try:
+            prepare_eval_history(save_dir, resume_iteration)
+        except Exception as error:
+            logger.warning(
+                'Failed to prepare evaluation curve history: {}.'.format(
+                    error))
 
     # use amp
     if precision == 'fp16':
@@ -184,6 +196,9 @@ def train(model,
     best_mean_iou = -1.0
     best_ema_mean_iou = -1.0
     best_model_iter = -1
+    eval_config = dict(test_config or {})
+    eval_config.setdefault('defect_eval', True)
+    eval_config['return_details'] = True
     reader_cost_averager = TimeAverager()
     batch_cost_averager = TimeAverager()
     save_models = deque()
@@ -336,24 +351,28 @@ def train(model,
                                                                  is not None):
                 num_workers = 1 if num_workers > 0 else 0
 
-                if test_config is None:
-                    test_config = {}
-
-                mean_iou, acc, _, _, _ = evaluate(model,
-                                                  val_dataset,
-                                                  num_workers=num_workers,
-                                                  precision=precision,
-                                                  amp_level=amp_level,
-                                                  **test_config)
+                eval_metrics, eval_details = evaluate(
+                    model,
+                    val_dataset,
+                    num_workers=num_workers,
+                    precision=precision,
+                    amp_level=amp_level,
+                    **eval_config)
+                mean_iou, acc, _, _, _ = eval_metrics
+                defect_rates = eval_details['defect_rates']
 
                 if use_ema:
-                    ema_mean_iou, ema_acc, _, _, _ = evaluate(
+                    ema_metrics, ema_eval_details = evaluate(
                         ema_model,
                         val_dataset,
                         num_workers=num_workers,
                         precision=precision,
                         amp_level=amp_level,
-                        **test_config)
+                        **eval_config)
+                    ema_mean_iou, ema_acc, _, _, _ = ema_metrics
+                    ema_defect_rates = ema_eval_details['defect_rates']
+                else:
+                    ema_defect_rates = None
 
                 model.train()
 
@@ -385,9 +404,16 @@ def train(model,
 
                 if val_dataset is not None:
                     states_dict = {'mIoU': mean_iou, 'Acc': acc, 'iter': iter}
+                    if defect_rates is not None:
+                        states_dict.update({
+                            'SampleHitRate': defect_rates['hit_rate'],
+                            'SampleMissRate': defect_rates['miss_rate'],
+                            'SampleOverRate': defect_rates['over_rate'],
+                        })
                     paddle.save(
                         states_dict,
                         os.path.join(current_save_dir, 'model.pdstates'))
+
                     if uniform_output_enabled:
                         save_model_info(states_dict, current_save_dir)
                         update_train_results(cli_args,
@@ -433,6 +459,15 @@ def train(model,
                             'Acc': ema_acc,
                             'iter': iter
                         }
+                        if ema_defect_rates is not None:
+                            ema_states_dict.update({
+                                'SampleHitRate':
+                                ema_defect_rates['hit_rate'],
+                                'SampleMissRate':
+                                ema_defect_rates['miss_rate'],
+                                'SampleOverRate':
+                                ema_defect_rates['over_rate'],
+                            })
                         paddle.save(
                             ema_states_dict,
                             os.path.join(current_save_dir,
@@ -469,12 +504,46 @@ def train(model,
                     if use_vdl:
                         log_writer.add_scalar('Evaluate/mIoU', mean_iou, iter)
                         log_writer.add_scalar('Evaluate/Acc', acc, iter)
+                        if defect_rates is not None:
+                            log_writer.add_scalar('Evaluate/SampleMissRate',
+                                                  defect_rates['miss_rate'],
+                                                  iter)
+                            log_writer.add_scalar('Evaluate/SampleOverRate',
+                                                  defect_rates['over_rate'],
+                                                  iter)
 
                         if use_ema:
                             log_writer.add_scalar('Evaluate/Ema_mIoU',
                                                   ema_mean_iou, iter)
                             log_writer.add_scalar('Evaluate/Ema_Acc', ema_acc,
                                                   iter)
+                            if ema_defect_rates is not None:
+                                log_writer.add_scalar(
+                                    'Evaluate/Ema_SampleMissRate',
+                                    ema_defect_rates['miss_rate'], iter)
+                                log_writer.add_scalar(
+                                    'Evaluate/Ema_SampleOverRate',
+                                    ema_defect_rates['over_rate'], iter)
+
+                    if defect_rates is not None:
+                        try:
+                            update_eval_history(
+                                save_dir,
+                                iteration=iter,
+                                miou=mean_iou,
+                                miss_rate=defect_rates['miss_rate'],
+                                over_rate=defect_rates['over_rate'],
+                                ema_miou=ema_mean_iou if use_ema else None,
+                                ema_miss_rate=(
+                                    ema_defect_rates['miss_rate']
+                                    if ema_defect_rates is not None else None),
+                                ema_over_rate=(
+                                    ema_defect_rates['over_rate']
+                                    if ema_defect_rates is not None else None))
+                        except Exception as error:
+                            logger.warning(
+                                'Failed to update evaluation curves: {}.'.format(
+                                    error))
 
                     if stop_status:
                         break

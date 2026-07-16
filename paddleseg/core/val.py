@@ -44,7 +44,8 @@ def evaluate(model,
              defect_eval=False,
              defect_iou_threshold=0.1,
              defect_min_pred_area=1,
-             defect_min_gt_area=1):
+             defect_min_gt_area=1,
+             return_details=False):
     """
     Launch evalution.
 
@@ -75,10 +76,15 @@ def evaluate(model,
             included in defect evaluation. Default: 1.
         defect_min_gt_area (int, optional): Minimum ground-truth component area
             included in defect evaluation. Default: 1.
+        return_details (bool, optional): Whether to return an additional detail
+            dictionary. The default keeps the original five-item return value
+            unchanged. Default: False.
 
     Returns:
-        float: The mIoU of validation datasets.
-        float: The accuracy of validation datasets.
+        tuple: By default, returns ``(mIoU, Acc, class_iou,
+            class_precision, Kappa)``. If ``return_details`` is True, returns
+            ``(metrics, details)``; ``details`` contains ``defect_stats`` and
+            ``defect_rates`` when defect evaluation is enabled.
     """
     model.eval()
     nranks = paddle.distributed.ParallelEnv().nranks
@@ -258,6 +264,7 @@ def evaluate(model,
     kappa = metrics.kappa(*metrics_input)
     class_dice, mdice = metrics.dice(*metrics_input)
 
+    defect_rates = None
     if defect_eval:
         defect_stats_tensor = paddle.to_tensor(
             defect_metrics.stats_to_array(defect_stats), dtype='int64')
@@ -302,4 +309,10 @@ def evaluate(model,
                     defect_stats['miss_sample'],
                     defect_stats['over_sample'], defect_rates['hit_rate'],
                     defect_rates['miss_rate'], defect_rates['over_rate']))
-    return miou, acc, class_iou, class_precision, kappa
+    eval_metrics = (miou, acc, class_iou, class_precision, kappa)
+    if return_details:
+        return eval_metrics, {
+            'defect_stats': defect_stats,
+            'defect_rates': defect_rates,
+        }
+    return eval_metrics
