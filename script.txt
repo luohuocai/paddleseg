@@ -5,6 +5,7 @@ CUDA_VISIBLE_DEVICES=0 python tools/train.py \
   --use_vdl \
   --num_workers 4 \
   --save_interval 1000 \
+  --keep_checkpoint_max 0 \
   --save_dir output/segformer_b0_srs+_1280x640_30k_boost
 
 
