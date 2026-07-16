@@ -279,6 +279,217 @@ def _draw_objects(image, objects, prefix, color, y_offset, font_scale,
                       (x, y + y_offset - 7), color, font_scale, thickness)
 
 
+def _xyxy_bbox(item):
+    x, y, width, height = item['bbox']
+    return (float(x), float(y), float(x + width), float(y + height))
+
+
+def _bbox_iou(first, second):
+    first_x1, first_y1, first_x2, first_y2 = first
+    second_x1, second_y1, second_x2, second_y2 = second
+    intersection_x1 = max(first_x1, second_x1)
+    intersection_y1 = max(first_y1, second_y1)
+    intersection_x2 = min(first_x2, second_x2)
+    intersection_y2 = min(first_y2, second_y2)
+    intersection_width = max(0.0, intersection_x2 - intersection_x1)
+    intersection_height = max(0.0, intersection_y2 - intersection_y1)
+    intersection = intersection_width * intersection_height
+    if intersection <= 0:
+        return 0.0
+    first_area = max(0.0, (first_x2 - first_x1) *
+                     (first_y2 - first_y1))
+    second_area = max(0.0, (second_x2 - second_x1) *
+                      (second_y2 - second_y1))
+    union = first_area + second_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _object_iou(first, second):
+    """Calculate contour IoU, falling back to bounding-box IoU."""
+    first_bbox = _xyxy_bbox(first)
+    second_bbox = _xyxy_bbox(second)
+    if _bbox_iou(first_bbox, second_bbox) == 0:
+        return 0.0
+
+    first_contour = first.get('contour')
+    second_contour = second.get('contour')
+    if first_contour is None or second_contour is None:
+        return _bbox_iou(first_bbox, second_bbox)
+
+    x1 = int(np.floor(min(first_bbox[0], second_bbox[0])))
+    y1 = int(np.floor(min(first_bbox[1], second_bbox[1])))
+    x2 = int(np.ceil(max(first_bbox[2], second_bbox[2])))
+    y2 = int(np.ceil(max(first_bbox[3], second_bbox[3])))
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        return 0.0
+
+    offset = np.asarray([[[x1, y1]]], dtype=np.float32)
+    first_contour = np.rint(first_contour.astype(np.float32) -
+                            offset).astype(np.int32)
+    second_contour = np.rint(second_contour.astype(np.float32) -
+                             offset).astype(np.int32)
+    first_mask = np.zeros((height, width), dtype=np.uint8)
+    second_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(first_mask, [first_contour.reshape(-1, 1, 2)], 1)
+    cv2.fillPoly(second_mask, [second_contour.reshape(-1, 1, 2)], 1)
+    intersection = int(
+        np.count_nonzero((first_mask > 0) & (second_mask > 0)))
+    if intersection <= 0:
+        return 0.0
+    union = int(np.count_nonzero((first_mask > 0) | (second_mask > 0)))
+    return intersection / union if union > 0 else 0.0
+
+
+def _evaluate_defect_objects(pred_objects, gt_objects, iou_threshold):
+    gt_hit = [False] * len(gt_objects)
+    pred_hit = [False] * len(pred_objects)
+    for gt_index, gt_object in enumerate(gt_objects):
+        for pred_index, pred_object in enumerate(pred_objects):
+            if _object_iou(gt_object, pred_object) >= iou_threshold:
+                gt_hit[gt_index] = True
+                pred_hit[pred_index] = True
+
+    hit_objects = sum(gt_hit)
+    miss_objects = sum(not is_hit for is_hit in gt_hit)
+    over_objects = sum(not is_hit for is_hit in pred_hit)
+    has_gt = len(gt_objects) > 0
+    has_hit_gt = hit_objects > 0
+    stats = {
+        'gt_object_count': len(gt_objects),
+        'pred_object_count': len(pred_objects),
+        'hit_object_count': hit_objects,
+        'miss_object_count': miss_objects,
+        'over_object_count': over_objects,
+        'hit_sample': int(has_hit_gt or
+                          (not has_gt and len(pred_objects) == 0)),
+        'miss_sample': int(has_gt and not has_hit_gt),
+        'over_sample': int((not has_gt and len(pred_objects) > 0) or
+                           (has_gt and not has_hit_gt and over_objects > 0)),
+    }
+    return gt_hit, pred_hit, stats
+
+
+def _draw_evaluation_object(image, item, color, text, thickness,
+                            font_scale):
+    contour = item['contour']
+    if contour is None:
+        x, y, width, height = item['bbox']
+        contour = np.asarray([[[x, y]], [[x + width, y]],
+                              [[x + width, y + height]],
+                              [[x, y + height]]],
+                             dtype=np.int32)
+    contour = np.rint(contour).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(image, [contour], True, color, thickness, cv2.LINE_AA)
+    points = contour.reshape(-1, 2)
+    x = max(0, int(np.min(points[:, 0])))
+    y = max(15, int(np.min(points[:, 1])) - 6)
+    cv2.putText(image, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                color, max(1, thickness - 1), cv2.LINE_AA)
+
+
+def annotate_defect_evaluation(image,
+                               prediction,
+                               label_path=None,
+                               class_names=None,
+                               background_id=0,
+                               ignore_index=255,
+                               iou_threshold=0.1,
+                               min_pred_area=1,
+                               min_gt_area=1,
+                               use_multilabel=False):
+    """Render the hit/miss/over visualization used by defect evaluation.
+
+    Ground-truth components hit by any prediction are green, missed ground
+    truths are red, and matched predictions are cyan.  Matching intentionally
+    ignores class names and uses contour IoU with bounding-box fallback.  A
+    missing label is treated as an OK image, matching the standalone batch
+    evaluator.
+
+    Returns:
+        tuple: The rendered BGR image and its object/sample statistics.
+    """
+    if not 0 <= iou_threshold <= 1:
+        raise ValueError('iou_threshold must be between 0 and 1.')
+    if min_pred_area < 1 or min_gt_area < 1:
+        raise ValueError('Minimum component areas must be at least 1.')
+    if isinstance(image, (str, os.PathLike)):
+        image_data = np.fromfile(os.fspath(image), dtype=np.uint8)
+        rendered = cv2.imdecode(image_data, cv2.IMREAD_COLOR)
+        if rendered is None:
+            raise ValueError('Failed to read image: {}'.format(image))
+    else:
+        rendered = np.asarray(image).copy()
+    if rendered.ndim != 3 or rendered.shape[2] != 3:
+        raise ValueError(
+            'Defect visualization expects a BGR image with three channels.')
+    height, width = rendered.shape[:2]
+
+    pred = np.asarray(prediction)
+    if not use_multilabel:
+        pred = np.squeeze(pred)
+        if pred.ndim != 2:
+            raise ValueError(
+                'Prediction must be a 2-D class-id mask, but got {}.'.format(
+                    pred.shape))
+        if pred.shape != (height, width):
+            pred = cv2.resize(
+                pred, (width, height), interpolation=cv2.INTER_NEAREST)
+    pred_objects = segmentation_objects(
+        pred,
+        class_names=class_names,
+        background_id=background_id,
+        ignore_index=ignore_index,
+        min_area=min_pred_area,
+        use_multilabel=use_multilabel)
+    gt_objects = _ground_truth_objects(label_path, (height, width), class_names,
+                                       background_id, ignore_index,
+                                       min_gt_area)
+    if gt_objects is None:
+        gt_objects = []
+
+    gt_hit, pred_hit, stats = _evaluate_defect_objects(
+        pred_objects, gt_objects, iou_threshold)
+
+    component_font_scale = max(0.5, min(0.9, width / 1600.0))
+    for index, gt_object in enumerate(gt_objects):
+        is_hit = gt_hit[index]
+        color = (0, 180, 0) if is_hit else (0, 0, 255)
+        text = ('GT:' if is_hit else 'MISS GT:') + gt_object['class_name']
+        _draw_evaluation_object(rendered, gt_object, color, text,
+                                3 if is_hit else 5, component_font_scale)
+
+    for index, pred_object in enumerate(pred_objects):
+        if pred_hit[index]:
+            _draw_evaluation_object(rendered, pred_object, (255, 255, 0),
+                                    'P:' + pred_object['class_name'], 2,
+                                    component_font_scale)
+
+    header = (
+        'GT={gt_object_count} Pred={pred_object_count} '
+        'miss_sample={miss_sample} over_sample={over_sample} '
+        'miss_obj={miss_object_count} over_obj={over_object_count}'.format(
+            **stats))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    header_scale = 1.6
+    header_thickness = 3
+    available_width = max(1, width - 36)
+    text_width = cv2.getTextSize(header, font, header_scale,
+                                 header_thickness)[0][0]
+    if text_width > available_width:
+        header_scale = max(0.4, header_scale * available_width / text_width)
+        header_thickness = max(1, int(round(header_scale * 2)))
+    header_height = min(height, max(42, int(round(header_scale * 52))))
+    cv2.rectangle(rendered, (0, 0), (width, header_height), (0, 0, 0),
+                  cv2.FILLED)
+    text_y = min(header_height - 10,
+                 max(24, int(round(header_scale * 35))))
+    cv2.putText(rendered, header, (18, text_y), font, header_scale,
+                (255, 255, 255), header_thickness, cv2.LINE_AA)
+    return rendered, stats
+
+
 def annotate_segmentation_classes(image,
                                   prediction,
                                   label_path=None,

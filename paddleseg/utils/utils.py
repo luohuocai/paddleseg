@@ -257,18 +257,21 @@ def get_image_list(image_path):
     return image_list, image_dir
 
 
-def get_image_list_with_labels(image_path):
-    """Get images and the optional labels from a PaddleSeg file list.
+def get_image_list_with_labels(image_path, label_dir=None):
+    """Get images and optional labels used by prediction visualizations.
 
     PaddleSeg file lists use ``image_path label_path`` on each line.  The
     existing :func:`get_image_list` intentionally discards the second column;
-    this helper preserves it for prediction visualizations that need to show
-    ground-truth information.  Single-image and directory inputs remain
-    supported and simply return an empty label map.
+    this helper preserves it.  For a single image or directory input, labels
+    are also discovered using the conventions used by defect-evaluation data:
+    a same-stem LabelMe JSON or a same-name mask below ``labels``.
 
     Args:
         image_path (str): An image, an image directory, or a PaddleSeg file
             list.
+        label_dir (str, optional): Explicit root containing class-id masks or
+            LabelMe JSON files. Labels are matched by relative path first and
+            filename/stem second.
 
     Returns:
         tuple: ``(image_list, image_dir, label_map)``.  ``label_map`` is keyed
@@ -280,26 +283,128 @@ def get_image_list_with_labels(image_path):
         '.JPEG', '.jpeg', '.JPG', '.jpg', '.BMP', '.bmp', '.PNG', '.png'
     }
 
-    if not os.path.isfile(image_path) or os.path.splitext(
-            image_path)[-1] in valid_suffix:
-        return image_list, image_dir, label_map
+    is_image_file = (os.path.isfile(image_path) and
+                     os.path.splitext(image_path)[-1] in valid_suffix)
+    is_file_list = os.path.isfile(image_path) and not is_image_file
 
-    list_dir = os.path.dirname(os.path.abspath(image_path))
-    with open(image_path, 'r', encoding='utf-8-sig') as file_list:
-        for line in file_list:
-            columns = line.strip().split()
-            if len(columns) < 2:
+    if is_file_list:
+        list_dir = os.path.dirname(os.path.abspath(image_path))
+        with open(image_path, 'r', encoding='utf-8-sig') as file_list:
+            for line in file_list:
+                columns = line.strip().split()
+                if len(columns) < 2:
+                    continue
+                image_file, label_file = columns[:2]
+                if not os.path.isabs(image_file):
+                    image_file = os.path.join(list_dir, image_file)
+                if not os.path.isabs(label_file):
+                    label_file = os.path.join(list_dir, label_file)
+                image_key = os.path.normcase(
+                    os.path.abspath(os.path.normpath(image_file)))
+                label_map[image_key] = os.path.normpath(label_file)
+
+    if os.path.isdir(image_path):
+        dataset_root = os.path.abspath(image_path)
+        filtered_images = []
+        for image_file in image_list:
+            relative_parts = os.path.relpath(image_file,
+                                             dataset_root).split(os.sep)
+            if any(part.lower() == 'labels'
+                   for part in relative_parts[:-1]):
                 continue
-            image_file, label_file = columns[:2]
-            if not os.path.isabs(image_file):
-                image_file = os.path.join(list_dir, image_file)
-            if not os.path.isabs(label_file):
-                label_file = os.path.join(list_dir, label_file)
-            image_key = os.path.normcase(
-                os.path.abspath(os.path.normpath(image_file)))
-            label_map[image_key] = os.path.normpath(label_file)
+            filtered_images.append(image_file)
+        image_list = filtered_images
+    elif is_image_file:
+        dataset_root = os.path.dirname(os.path.abspath(image_path))
+    else:
+        dataset_root = os.path.dirname(os.path.abspath(image_path))
+
+    if label_dir is not None:
+        label_dir = os.path.abspath(label_dir)
+    for image_file in image_list:
+        image_key = os.path.normcase(
+            os.path.abspath(os.path.normpath(image_file)))
+        if image_key in label_map:
+            continue
+        label_path = None
+        if label_dir is not None:
+            label_path = _discover_label_in_directory(
+                image_file, dataset_root, label_dir)
+        if label_path is None:
+            label_path = _discover_prediction_label(image_file, dataset_root)
+        if label_path is not None:
+            label_map[image_key] = label_path
 
     return image_list, image_dir, label_map
+
+
+def _discover_prediction_label(image_file, dataset_root):
+    """Find a LabelMe JSON or class-id mask associated with an image."""
+    image_file = os.path.abspath(image_file)
+    dataset_root = os.path.abspath(dataset_root)
+    image_dir = os.path.dirname(image_file)
+    image_name = os.path.basename(image_file)
+    image_stem = os.path.splitext(image_name)[0]
+    try:
+        relative_image = os.path.relpath(image_file, dataset_root)
+    except ValueError:
+        relative_image = image_name
+
+    json_candidates = [
+        os.path.splitext(image_file)[0] + '.json',
+        os.path.join(dataset_root, image_stem + '.json'),
+    ]
+    mask_candidates = [
+        os.path.join(dataset_root, 'labels', relative_image),
+        os.path.join(dataset_root, 'labels', image_name),
+        os.path.join(image_dir, 'labels', image_name),
+    ]
+    seen = set()
+    for candidate in json_candidates + mask_candidates:
+        candidate = os.path.normpath(candidate)
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _discover_label_in_directory(image_file, image_root, label_dir):
+    """Match an image to a mask in an explicitly supplied label directory."""
+    image_file = os.path.abspath(image_file)
+    image_root = os.path.abspath(image_root)
+    label_dir = os.path.abspath(label_dir)
+    image_name = os.path.basename(image_file)
+    image_stem = os.path.splitext(image_name)[0]
+    try:
+        relative_image = os.path.relpath(image_file, image_root)
+    except ValueError:
+        relative_image = image_name
+
+    relative_stem = os.path.splitext(relative_image)[0]
+    candidates = [
+        os.path.join(label_dir, relative_stem + '.json'),
+        os.path.join(label_dir, image_stem + '.json'),
+        os.path.join(label_dir, relative_image),
+        os.path.join(label_dir, image_name),
+    ]
+    for extension in ('.png', '.bmp', '.tif', '.tiff'):
+        candidates.extend([
+            os.path.join(label_dir, relative_stem + extension),
+            os.path.join(label_dir, image_stem + extension),
+        ])
+    seen = set()
+    for candidate in candidates:
+        candidate = os.path.normpath(candidate)
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
 
 class NoAliasDumper(yaml.SafeDumper):

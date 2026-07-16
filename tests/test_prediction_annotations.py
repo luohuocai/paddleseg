@@ -119,6 +119,93 @@ class PredictionAnnotationsTest(unittest.TestCase):
         self.assertIn('GT: N/A', texts)
         self.assertIn('Pred: OK', texts)
 
+    def test_defect_evaluation_visualization_matches_batch_rules(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            label_path = Path(temp_dir) / 'label.png'
+            label = np.zeros((100, 140), dtype=np.uint8)
+            label[20:50, 10:40] = 1
+            label[60:90, 80:110] = 1
+            Image.fromarray(label, mode='L').save(label_path)
+
+            prediction = np.zeros_like(label)
+            prediction[22:48, 12:38] = 2
+            prediction[60:80, 10:30] = 2
+            image = np.full((100, 140, 3), 100, dtype=np.uint8)
+
+            original_put_text = cv2.putText
+            with mock.patch.object(
+                    seg_visualize.cv2,
+                    'putText',
+                    side_effect=original_put_text) as put_text:
+                rendered, stats = \
+                    seg_visualize.annotate_defect_evaluation(
+                        image,
+                        prediction,
+                        label_path=str(label_path),
+                        class_names=['_background_', 'BL', 'GS'],
+                        iou_threshold=0.1,
+                        min_pred_area=1,
+                        min_gt_area=1)
+
+            self.assertEqual(stats['gt_object_count'], 2)
+            self.assertEqual(stats['pred_object_count'], 2)
+            self.assertEqual(stats['hit_object_count'], 1)
+            self.assertEqual(stats['miss_object_count'], 1)
+            self.assertEqual(stats['over_object_count'], 1)
+            self.assertEqual(stats['hit_sample'], 1)
+            self.assertEqual(stats['miss_sample'], 0)
+            self.assertEqual(stats['over_sample'], 0)
+            texts = [call.args[1] for call in put_text.call_args_list]
+            self.assertIn('GT:BL', texts)
+            self.assertIn('MISS GT:BL', texts)
+            self.assertIn('P:GS', texts)
+            self.assertIn(
+                'GT=2 Pred=2 miss_sample=0 over_sample=0 miss_obj=1 over_obj=1',
+                texts)
+            self.assertEqual(rendered.shape, image.shape)
+
+    def test_defect_evaluation_treats_unlabeled_images_as_ok(self):
+        image = np.zeros((30, 40, 3), dtype=np.uint8)
+        prediction = np.zeros((30, 40), dtype=np.uint8)
+        _, stats = seg_visualize.annotate_defect_evaluation(
+            image,
+            prediction,
+            class_names=['_background_'],
+            min_pred_area=1,
+            min_gt_area=1)
+        self.assertEqual(stats['hit_sample'], 1)
+        self.assertEqual(stats['miss_sample'], 0)
+        self.assertEqual(stats['over_sample'], 0)
+
+        prediction[5:15, 5:15] = 1
+        _, stats = seg_visualize.annotate_defect_evaluation(
+            image,
+            prediction,
+            class_names=['_background_', 'defect'],
+            min_pred_area=1,
+            min_gt_area=1)
+        self.assertEqual(stats['hit_sample'], 0)
+        self.assertEqual(stats['miss_sample'], 0)
+        self.assertEqual(stats['over_sample'], 1)
+        self.assertEqual(stats['over_object_count'], 1)
+
+    def test_defect_evaluation_reads_unicode_image_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / '测试图片.png'
+            image = np.full((24, 32, 3), 80, dtype=np.uint8)
+            encoded, buffer = cv2.imencode('.png', image)
+            self.assertTrue(encoded)
+            buffer.tofile(str(image_path))
+            prediction = np.zeros((24, 32), dtype=np.uint8)
+            rendered, stats = seg_visualize.annotate_defect_evaluation(
+                str(image_path),
+                prediction,
+                class_names=['_background_'],
+                min_pred_area=1,
+                min_gt_area=1)
+            self.assertEqual(rendered.shape, image.shape)
+            self.assertEqual(stats['hit_sample'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

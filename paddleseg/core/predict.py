@@ -70,7 +70,11 @@ def predict(model,
             annotate_classes=False,
             annotation_min_area=20,
             background_id=0,
-            ignore_index=255):
+            ignore_index=255,
+            defect_eval=False,
+            defect_iou_threshold=0.1,
+            defect_min_pred_area=1,
+            defect_min_gt_area=1):
     """
     predict and visualize the image_list.
 
@@ -102,6 +106,14 @@ def predict(model,
             Default: 20.
         background_id (int, optional): Background class id. Default: 0.
         ignore_index (int, optional): Ignored ground-truth class id. Default: 255.
+        defect_eval (bool, optional): Whether to save hit/miss/over defect
+            visualizations. Default: False.
+        defect_iou_threshold (float, optional): Contour IoU threshold for a
+            hit. Default: 0.1.
+        defect_min_pred_area (int, optional): Minimum predicted component area
+            used by defect visualization. Default: 1.
+        defect_min_gt_area (int, optional): Minimum ground-truth component area
+            used by defect visualization. Default: 1.
 
     """
     utils.utils.load_entire_model(model, model_path)
@@ -115,6 +127,7 @@ def predict(model,
 
     added_saved_dir = os.path.join(save_dir, 'added_prediction')
     pred_saved_dir = os.path.join(save_dir, 'pseudo_color_prediction')
+    eval_saved_dir = os.path.join(save_dir, 'defect_eval_visualization')
 
     logger.info("Start to predict...")
     progbar_pred = progbar.Progbar(target=len(img_lists[0]), verbose=1)
@@ -159,8 +172,8 @@ def predict(model,
             # save added image
             added_image = utils.visualize.visualize(
                 im_path, pred, color_map, weight=0.6, use_multilabel=use_multilabel)
+            label_path = label_map.get(normalized_path(im_path))
             if annotate_classes:
-                label_path = label_map.get(normalized_path(im_path))
                 try:
                     added_image = utils.visualize.annotate_segmentation_classes(
                         added_image,
@@ -179,6 +192,35 @@ def predict(model,
             mkdir(added_image_path)
             cv2.imwrite(added_image_path, added_image)
 
+            if defect_eval:
+                try:
+                    eval_image, eval_stats = \
+                        utils.visualize.annotate_defect_evaluation(
+                            im_path,
+                            pred,
+                            label_path=label_path,
+                            class_names=class_names,
+                            background_id=background_id,
+                            ignore_index=ignore_index,
+                            iou_threshold=defect_iou_threshold,
+                            min_pred_area=defect_min_pred_area,
+                            min_gt_area=defect_min_gt_area,
+                            use_multilabel=use_multilabel)
+                    eval_file = '{}__miss{}_over{}.png'.format(
+                        os.path.splitext(im_file)[0],
+                        eval_stats['miss_sample'],
+                        eval_stats['over_sample'])
+                    eval_image_path = os.path.join(eval_saved_dir, eval_file)
+                    mkdir(eval_image_path)
+                    encoded, buffer = cv2.imencode('.png', eval_image)
+                    if not encoded:
+                        raise RuntimeError('OpenCV failed to encode PNG.')
+                    buffer.tofile(eval_image_path)
+                except Exception as error:
+                    logger.warning(
+                        'Failed to create defect evaluation visualization for '
+                        '{}: {}'.format(im_path, error))
+
             # save pseudo color prediction
             pred_mask = utils.visualize.get_pseudo_color_map(
                 pred, color_map, use_multilabel=use_multilabel)
@@ -189,5 +231,8 @@ def predict(model,
 
             progbar_pred.update(i + 1)
 
-    logger.info("Predicted images are saved in {} and {} .".format(
-        added_saved_dir, pred_saved_dir))
+    output_dirs = [added_saved_dir, pred_saved_dir]
+    if defect_eval:
+        output_dirs.append(eval_saved_dir)
+    logger.info("Predicted images are saved in {} .".format(
+        ', '.join(output_dirs)))

@@ -65,8 +65,14 @@ def parse_args():
         type=str,
         help=(
             'Optional class_names.txt whose line index is the class id. When '
-            'omitted, class_names.txt next to the input file list is used if '
-            'it exists.'))
+            'omitted, dataset-local class_names.txt locations are searched.'))
+    parser.add_argument(
+        '--label_dir',
+        type=str,
+        help=(
+            'Optional directory containing ground-truth class-id masks or '
+            'LabelMe JSON files. Use this when image and label directories '
+            'are separate, for example images/val and labels/val.'))
     parser.add_argument(
         '--annotation_min_area',
         type=int,
@@ -82,6 +88,29 @@ def parse_args():
         type=int,
         default=255,
         help='Ground-truth class id ignored when annotating. Default: 255.')
+    parser.add_argument(
+        '--defect_eval_visualization',
+        action='store_true',
+        help=(
+            'Save GT/prediction hit, miss, and over-detection visualizations. '
+            'This is also enabled by test_config.defect_eval.'))
+    parser.add_argument(
+        '--defect_iou_threshold',
+        type=float,
+        default=None,
+        help=(
+            'Contour IoU threshold used by defect visualization. It overrides '
+            'test_config.defect_iou_threshold when provided.'))
+    parser.add_argument(
+        '--defect_min_pred_area',
+        type=int,
+        default=None,
+        help='Minimum predicted component area used by defect visualization.')
+    parser.add_argument(
+        '--defect_min_gt_area',
+        type=int,
+        default=None,
+        help='Minimum GT component area used by defect visualization.')
 
     # Data augment params
     parser.add_argument(
@@ -144,10 +173,12 @@ def merge_test_config(cfg, args):
         test_config.pop('aug_eval')
     if 'auc_roc' in test_config:
         test_config.pop('auc_roc')
-    # These options belong to validation only and are not accepted by
-    # paddleseg.core.predict.
+    supported_defect_options = {
+        'defect_eval', 'defect_iou_threshold', 'defect_min_pred_area',
+        'defect_min_gt_area'
+    }
     for key in list(test_config.keys()):
-        if key.startswith('defect_'):
+        if key.startswith('defect_') and key not in supported_defect_options:
             test_config.pop(key)
     if args.aug_pred:
         test_config['aug_pred'] = args.aug_pred
@@ -162,20 +193,50 @@ def merge_test_config(cfg, args):
         test_config['custom_color'] = args.custom_color
     if args.use_multilabel:
         test_config['use_multilabel'] = args.use_multilabel
+    if args.defect_eval_visualization:
+        test_config['defect_eval'] = True
+    if args.defect_iou_threshold is not None:
+        test_config['defect_iou_threshold'] = args.defect_iou_threshold
+    if args.defect_min_pred_area is not None:
+        test_config['defect_min_pred_area'] = args.defect_min_pred_area
+    if args.defect_min_gt_area is not None:
+        test_config['defect_min_gt_area'] = args.defect_min_gt_area
     return test_config
 
 
-def load_class_names(class_names_path, image_path, num_classes):
+def load_class_names(class_names_path,
+                     image_path,
+                     num_classes,
+                     label_dir=None):
     """Load class-id names, with a dataset-local automatic fallback."""
     resolved_path = class_names_path
-    if resolved_path is None and os.path.isfile(image_path):
-        extension = os.path.splitext(image_path)[1].lower()
-        if extension not in ('.jpg', '.jpeg', '.png', '.bmp'):
-            candidate = os.path.join(
-                os.path.dirname(os.path.abspath(image_path)),
-                'class_names.txt')
+    if resolved_path is None:
+        if os.path.isdir(image_path):
+            dataset_dir = os.path.abspath(image_path)
+        else:
+            dataset_dir = os.path.dirname(os.path.abspath(image_path))
+        candidates = []
+        if label_dir is not None:
+            try:
+                common_dir = os.path.commonpath(
+                    [dataset_dir, os.path.abspath(label_dir)])
+            except ValueError:
+                common_dir = None
+            candidates.append(os.path.join(label_dir, 'class_names.txt'))
+            candidates.append(
+                os.path.join(os.path.dirname(os.path.abspath(label_dir)),
+                             'class_names.txt'))
+            if common_dir is not None:
+                candidates.append(os.path.join(common_dir,
+                                               'class_names.txt'))
+        candidates.extend([
+            os.path.join(dataset_dir, 'labels', 'class_names.txt'),
+            os.path.join(dataset_dir, 'class_names.txt'),
+        ])
+        for candidate in candidates:
             if os.path.isfile(candidate):
                 resolved_path = candidate
+                break
 
     if resolved_path is None:
         logger.warning(
@@ -223,24 +284,43 @@ def main(args):
 
     model = builder.model
     transforms = Compose(builder.val_transforms)
+    if args.label_dir is not None and not os.path.isdir(args.label_dir):
+        raise FileNotFoundError(
+            'Ground-truth label directory does not exist: {}'.format(
+                args.label_dir))
     image_list, image_dir, label_map = get_image_list_with_labels(
-        args.image_path)
+        args.image_path, label_dir=args.label_dir)
     logger.info('The number of images: {}'.format(len(image_list)))
 
+    defect_eval = bool(test_config.get('defect_eval', False))
     class_names = None
-    if args.annotate_classes:
+    if args.annotate_classes or defect_eval:
         if args.annotation_min_area < 1:
             raise ValueError('--annotation_min_area must be at least 1.')
+        defect_iou_threshold = test_config.get('defect_iou_threshold', 0.1)
+        defect_min_pred_area = test_config.get('defect_min_pred_area', 1)
+        defect_min_gt_area = test_config.get('defect_min_gt_area', 1)
+        if not 0 <= defect_iou_threshold <= 1:
+            raise ValueError('--defect_iou_threshold must be between 0 and 1.')
+        if defect_min_pred_area < 1 or defect_min_gt_area < 1:
+            raise ValueError('Defect minimum component areas must be at least 1.')
         model_cfg = cfg.dic.get('model', {})
         val_dataset_cfg = cfg.dic.get('val_dataset', {})
         num_classes = model_cfg.get('num_classes',
                                     val_dataset_cfg.get('num_classes', 0))
         class_names = load_class_names(args.class_names, args.image_path,
-                                       num_classes)
-        if not label_map:
+                                       num_classes, args.label_dir)
+        if args.annotate_classes and not label_map:
             logger.warning(
                 'No ground-truth paths were found in --image_path. Predicted '
                 'classes will be annotated, and GT will be shown as N/A.')
+        missing_label_count = len(image_list) - len(label_map)
+        if defect_eval and missing_label_count:
+            logger.warning(
+                '{} of {} inputs have no ground-truth path. Defect '
+                'visualization will treat those inputs as unlabeled OK '
+                'samples, matching the standalone batch evaluator.'.format(
+                    missing_label_count, len(image_list)))
 
     predict(
         model,
